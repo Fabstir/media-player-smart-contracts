@@ -1,0 +1,23 @@
+# Hardhat artifacts
+artifacts/
+cache/
+
+# Node modules
+node_modules/
+
+# Environment variables
+.env
+
+# Editor folders and files
+.vscode/
+*.swp
+*.swo
+*.bak
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Compiled contracts
+*.json
