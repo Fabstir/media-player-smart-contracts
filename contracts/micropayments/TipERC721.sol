@@ -21,7 +21,7 @@ contract TipERC721 is
     OwnableUpgradeable,
     PausableUpgradeable,
     AccessControlUpgradeable,
-    ERC721BurnableUpgradeable,
+    ERC721BurnableUpgradeable
 {
     bytes32 public constant URI_SETTER_ROLE = keccak256("URI_SETTER_ROLE");
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
