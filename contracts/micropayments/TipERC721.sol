@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.21;
+pragma solidity ^0.8.25;
 
 import "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC721/extensions/ERC721URIStorageUpgradeable.sol";
@@ -13,6 +13,14 @@ import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.
 import "@openzeppelin/contracts-upgradeable/utils/CountersUpgradeable.sol";
 import "hardhat/console.sol";
 
+/**
+ * @title TipERC721
+ * @dev TipERC721 is a smart contract that extends the ERC721 standard to include tipping functionality.
+ * This contract allows users to send tips to the owners of ERC721 tokens.
+ *
+ * @notice This contract is part of a system that enables users to tip the owners of ERC721 tokens,
+ * adding an additional layer of interaction and monetisation.
+ */
 contract TipERC721 is
     Initializable,
     ERC721Upgradeable,

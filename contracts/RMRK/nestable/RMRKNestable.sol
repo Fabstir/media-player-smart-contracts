@@ -2,7 +2,7 @@
 
 //Generally all interactions should propagate downstream
 
-pragma solidity ^0.8.21;
+pragma solidity ^0.8.25;
 
 import "./IERC7401.sol";
 import "../core/RMRKCore.sol";
