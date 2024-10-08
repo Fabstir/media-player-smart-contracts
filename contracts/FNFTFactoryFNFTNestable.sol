@@ -19,8 +19,9 @@ contract FNFTFactoryFNFTNestable {
     /**
      * @notice Deploys a new FNFTNestable NFT
      */
-    function deploy() external {
+    function deploy(string memory name, string memory symbol) external {
         FNFTNestable fnftNestable = new FNFTNestable();
+        fnftNestable.initialize(name, symbol);
 
         emit FNFTNestableCreated(address(fnftNestable));
     }
