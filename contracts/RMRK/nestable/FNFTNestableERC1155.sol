@@ -6,17 +6,22 @@ import "./INestableERC1155.sol";
 import "@openzeppelin/contracts-upgradeable/utils/CountersUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "../library/RMRKErrors.sol";
+import "./FNFTNestableErrors.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import "@openzeppelin/contracts/utils/Address.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC1155/IERC1155ReceiverUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC1155/utils/ERC1155ReceiverUpgradeable.sol";
 
-contract FNFTNestableERC1155 is Initializable, TipERC1155, INestableERC1155 {
-    using CountersUpgradeable for CountersUpgradeable.Counter;
+contract FNFTNestableERC1155 is
+    Initializable,
+    TipERC1155,
+    INestableERC1155,
+    ERC1155ReceiverUpgradeable
+{
     using Address for address;
 
-    CountersUpgradeable.Counter private _tokenIdCounter;
-
     // Mapping from token ID to direct owner
-    mapping(uint256 => DirectOwner) private _RMRKOwners;
+    mapping(address => mapping(uint256 => DirectOwner)) _RMRKOwners;
 
     // Mapping from token ID to array of active children structs
     mapping(uint256 => Child[]) internal _activeChildren;
@@ -24,26 +29,19 @@ contract FNFTNestableERC1155 is Initializable, TipERC1155, INestableERC1155 {
     // Mapping from token ID to array of pending children structs
     mapping(uint256 => Child[]) internal _pendingChildren;
 
-    // Mapping of child token address to child token ID to whether they are pending or active on any token
-    mapping(address => mapping(uint256 => uint256)) internal _childIsInActive;
-
-    /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor() {
-        _disableInitializers();
-    }
-
     function initialize() public override initializer {
-        TipERC1155.initialize();
-        __FNFTNestableERC1155_init();
-        __ReentrancyGuard_init();
+        __TipERC1155_init();
     }
 
-    function __FNFTNestableERC1155_init() internal initializer {
-        __FNFTNestableERC1155_init_unchained();
-    }
-
-    function __FNFTNestableERC1155_init_unchained() internal initializer {
-        // Initialize any FNFTNestableERC1155 specific state variables here
+    struct TransferChildParams {
+        uint256 tokenId;
+        address to;
+        uint256 destinationId;
+        uint256 childIndex;
+        address childAddress;
+        uint256 childId;
+        uint256 amount;
+        bytes data;
     }
 
     function mintToken(
@@ -60,25 +58,37 @@ contract FNFTNestableERC1155 is Initializable, TipERC1155, INestableERC1155 {
             amount,
             data
         );
+
+        // For a root token (not nested), set the direct owner to the minter (account)
+        _RMRKOwners[address(this)][newTokenId] = DirectOwner({
+            tokenId: 0, // Indicates root token (non-nested)
+            ownerAddress: account
+        });
+
         return newTokenId;
     }
 
     function ownerOf(uint256 tokenId) public view override returns (address) {
-        (address owner, uint256 ownerTokenId, bool isNft) = directOwnerOf(
+        (address currentOwner, uint256 parentId, bool isNft) = directOwnerOf(
             tokenId
         );
-        if (isNft) {
-            owner = INestableERC1155(owner).ownerOf(ownerTokenId);
+        // Traverse up the ownership chain until we reach an EOA or non-NFT contract
+        while (isNft) {
+            (currentOwner, parentId, isNft) = INestableERC1155(currentOwner)
+                .directOwnerOf(parentId);
         }
-        return owner;
+        return currentOwner;
     }
 
     function directOwnerOf(
         uint256 tokenId
     ) public view override returns (address, uint256, bool) {
-        DirectOwner memory owner = _RMRKOwners[tokenId];
+        DirectOwner memory owner = _RMRKOwners[address(this)][tokenId];
         if (owner.ownerAddress == address(0)) revert RMRKPartDoesNotExist();
-        return (owner.ownerAddress, owner.tokenId, owner.tokenId != 0);
+
+        // Token is nested if it has a parent token ID
+        bool isNft = owner.tokenId > 0;
+        return (owner.ownerAddress, owner.tokenId, isNft);
     }
 
     function addChild(
@@ -86,18 +96,25 @@ contract FNFTNestableERC1155 is Initializable, TipERC1155, INestableERC1155 {
         uint256 childId,
         bytes memory data
     ) public override {
-        require(_exists(parentId), "ERC1155: parent token does not exist");
+        if (!_exists(parentId)) revert FNFTNestableParentTokenDoesNotExist();
         address childAddress = _msgSender();
-        require(childAddress != address(this), "Cannot add child to self");
+        if (childAddress == address(this)) revert FNFTNestableCannotNestSelf();
 
-        uint256 parentBalance = balanceOf(_msgSender(), parentId);
-        require(parentBalance > 0, "Not owner of parent token");
+        if (!_isApprovedOrOwner(_msgSender(), parentId))
+            revert FNFTNestableCallerNotOwnerNorApproved();
+
+        uint256 parentBalance = balanceOf(
+            _RMRKOwners[address(this)][parentId].ownerAddress,
+            parentId
+        );
+        if (parentBalance == 0) revert FNFTNestableInsufficientChildBalance();
 
         uint256 childBalance = IERC1155(childAddress).balanceOf(
             _msgSender(),
             childId
         );
-        require(childBalance >= parentBalance, "Insufficient child balance");
+        if (childBalance < parentBalance)
+            revert FNFTNestableInsufficientChildBalance();
 
         Child memory child = Child({
             tokenId: childId,
@@ -108,6 +125,8 @@ contract FNFTNestableERC1155 is Initializable, TipERC1155, INestableERC1155 {
         _addChild(parentId, child, data);
     }
 
+    // Implementation uses direct nesting model rather than proposal/acceptance model
+    // Can only add a balance of child tokens equal to the parent balance
     function addChildNFT(
         uint256 parentId,
         address childAddress,
@@ -116,30 +135,77 @@ contract FNFTNestableERC1155 is Initializable, TipERC1155, INestableERC1155 {
     ) public virtual {
         if (!_exists(parentId)) revert RMRKTokenDoesNotHaveAsset();
 
-        uint256 parentBalance = balanceOf(_msgSender(), parentId);
-        if (parentBalance == 0) revert RMRKInsufficientParentBalance();
+        if (!_isApprovedOrOwner(_msgSender(), parentId))
+            revert FNFTNestableCallerNotOwnerNorApproved();
+
+        // Check if parent has a parent (is nested)
+        (
+            address parentOwner,
+            uint256 grandParentId,
+            bool isNft
+        ) = directOwnerOf(parentId);
+
+        uint256 parentBalance;
+        if (isNft) {
+            // Check balance in parent's contract context
+            parentBalance = IERC1155(address(this)).balanceOf(
+                parentOwner,
+                parentId
+            );
+        } else {
+            parentBalance = balanceOf(parentOwner, parentId);
+        }
+
+        if (parentBalance == 0) revert FNFTNestableInsufficientChildBalance();
 
         uint256 childBalance = IERC1155(childAddress).balanceOf(
             _msgSender(),
             childId
         );
-        if (childBalance < parentBalance) revert RMRKInsufficientChildBalance();
+        if (childBalance < parentBalance)
+            revert FNFTNestableInsufficientChildBalance();
 
-        IERC1155(childAddress).safeTransferFrom(
-            _msgSender(),
-            address(this),
-            childId,
-            parentBalance,
-            data
-        );
+        if (
+            IERC165Upgradeable(childAddress).supportsInterface(
+                type(INestableERC1155).interfaceId
+            )
+        ) {
+            // Use nestTransferFrom
+            INestableERC1155(childAddress).nestTransferFrom(
+                _msgSender(),
+                address(this),
+                childId,
+                parentBalance,
+                parentId,
+                data
+            );
+        } else {
+            // Regular ERC1155 transfer
+            IERC1155(childAddress).safeTransferFrom(
+                _msgSender(),
+                address(this),
+                childId,
+                parentBalance,
+                data
+            );
+        }
 
-        Child memory child = Child({
+        // Add this child to the active children array.
+        Child memory newChild = Child({
             tokenId: childId,
             contractAddress: childAddress,
             amount: parentBalance
         });
+        _activeChildren[parentId].push(newChild);
 
-        _addChild(parentId, child, data);
+        emit NestTransfer(
+            _msgSender(), // from: previous owner
+            address(this), // to: this contract
+            0, // fromTokenId: 0 as not nested before
+            parentId, // toTokenId: parent's token ID
+            childId, // tokenId: child token being transferred
+            parentBalance // amount being transferred
+        );
     }
 
     function acceptChild(
@@ -148,15 +214,11 @@ contract FNFTNestableERC1155 is Initializable, TipERC1155, INestableERC1155 {
         address childAddress,
         uint256 childId
     ) public override {
-        require(
-            _isApprovedOrOwner(_msgSender(), parentId),
-            "ERC1155: caller is not owner nor approved"
-        );
+        if (!_isApprovedOrOwner(_msgSender(), parentId))
+            revert FNFTNestableCallerNotOwnerNorApproved();
         Child memory child = pendingChildOf(parentId, childIndex);
-        require(
-            child.contractAddress == childAddress && child.tokenId == childId,
-            "Child does not match"
-        );
+        if (child.contractAddress != childAddress || child.tokenId != childId)
+            revert FNFTNestableChildDoesNotMatch();
 
         _acceptChild(parentId, childIndex, childAddress, childId);
     }
@@ -165,10 +227,8 @@ contract FNFTNestableERC1155 is Initializable, TipERC1155, INestableERC1155 {
         uint256 parentId,
         uint256 maxRejections
     ) public override {
-        require(
-            _isApprovedOrOwner(_msgSender(), parentId),
-            "ERC1155: caller is not owner nor approved"
-        );
+        if (!_isApprovedOrOwner(_msgSender(), parentId))
+            revert FNFTNestableCallerNotOwnerNorApproved();
 
         uint256 pendingChildren = _pendingChildren[parentId].length;
         if (pendingChildren > maxRejections) {
@@ -192,29 +252,27 @@ contract FNFTNestableERC1155 is Initializable, TipERC1155, INestableERC1155 {
         bool isPending,
         bytes memory data
     ) public override nonReentrant {
-        require(
-            _isApprovedOrOwner(_msgSender(), tokenId),
-            "ERC1155: caller is not owner nor approved"
-        );
+        // If approval check fails, log before revert:
+        if (!_isApprovedOrOwner(_msgSender(), tokenId)) {
+            revert FNFTNestableCallerNotOwnerNorApproved();
+        }
 
         Child[] storage childrenArray = isPending
             ? _pendingChildren[tokenId]
             : _activeChildren[tokenId];
-        require(childIndex < childrenArray.length, "Child index out of bounds");
-        require(
-            childrenArray[childIndex].contractAddress == childAddress,
-            "Wrong child address"
-        );
-        require(
-            childrenArray[childIndex].tokenId == childId,
-            "Wrong child token ID"
-        );
 
-        uint256 amount = balanceOf(_msgSender(), tokenId);
-
-        if (to == address(0) && destinationId != 0) {
-            revert("Cannot burn nested tokens directly");
+        if (childIndex >= childrenArray.length) {
+            revert FNFTNestableChildIndexOutOfRange();
         }
+        if (childrenArray[childIndex].contractAddress != childAddress) {
+            revert FNFTNestableChildAddressMismatch();
+        }
+        if (childrenArray[childIndex].tokenId != childId) {
+            revert FNFTNestableChildIdMismatch();
+        }
+
+        // Use amount stored when child was nested
+        uint256 amount = childrenArray[childIndex].amount;
 
         if (isPending) {
             _transferPendingChild(
@@ -229,14 +287,16 @@ contract FNFTNestableERC1155 is Initializable, TipERC1155, INestableERC1155 {
             );
         } else {
             _transferActiveChild(
-                tokenId,
-                to,
-                destinationId,
-                childIndex,
-                childAddress,
-                childId,
-                amount,
-                data
+                TransferChildParams({
+                    tokenId: tokenId,
+                    to: to,
+                    destinationId: destinationId,
+                    childIndex: childIndex,
+                    childAddress: childAddress,
+                    childId: childId,
+                    amount: amount,
+                    data: data
+                })
             );
         }
     }
@@ -252,12 +312,12 @@ contract FNFTNestableERC1155 is Initializable, TipERC1155, INestableERC1155 {
         safeTransferFrom(from, to, tokenId, amount, data);
 
         if (destinationId != 0) {
-            _RMRKOwners[tokenId] = DirectOwner({
+            _RMRKOwners[address(this)][tokenId] = DirectOwner({
                 ownerAddress: to,
                 tokenId: destinationId
             });
         } else {
-            delete _RMRKOwners[tokenId];
+            delete _RMRKOwners[address(this)][tokenId];
         }
 
         emit NestTransfer(from, to, 0, destinationId, tokenId, amount);
@@ -303,31 +363,24 @@ contract FNFTNestableERC1155 is Initializable, TipERC1155, INestableERC1155 {
         );
 
         // Check if the sender is the owner or approved
-        require(
-            _isApprovedOrDirectOwner(sender, tokenId),
-            "FNFTNestableERC1155: transfer caller is not owner nor approved"
-        );
+        if (!_isApprovedOrDirectOwner(sender, tokenId))
+            revert FNFTNestableCallerNotOwnerNorApproved();
 
         // Check that the new owner is not the zero address
-        require(
-            newOwner != address(0),
-            "FNFTNestableERC1155: new owner is the zero address"
-        );
+        if (newOwner == address(0)) revert RMRKNewOwnerIsZeroAddress();
 
         // Check that the new owner is not the current owner
-        require(
-            currentOwner != newOwner,
-            "FNFTNestableERC1155: new owner is the current owner"
-        );
+        if (currentOwner == newOwner)
+            revert FNFTNestableNewOwnerIsCurrentOwner();
 
         // Update the owner in the RMRK ownership structure
-        _RMRKOwners[tokenId] = DirectOwner({
+        _RMRKOwners[address(this)][tokenId] = DirectOwner({
             ownerAddress: newOwner,
             tokenId: 0 // Reset to 0 as it's now owned by an address, not a token
         });
 
         // Emit the OwnershipTransferred event
-        emit OwnershipTransferred(tokenId, currentOwner, newOwner);
+        emit TokenOwnershipTransferred(tokenId, currentOwner, newOwner);
     }
 
     // Helper function to check if the caller is approved or direct owner
@@ -354,8 +407,6 @@ contract FNFTNestableERC1155 is Initializable, TipERC1155, INestableERC1155 {
         uint256 amount,
         bytes memory data
     ) internal {
-        Child storage child = _pendingChildren[tokenId][childIndex];
-
         if (to == address(0)) {
             _removeChildByIndex(_pendingChildren[tokenId], childIndex);
             INestableERC1155(childAddress).burn(childId, amount, 0);
@@ -391,67 +442,69 @@ contract FNFTNestableERC1155 is Initializable, TipERC1155, INestableERC1155 {
         );
     }
 
-    function _transferActiveChild(
-        uint256 tokenId,
-        address to,
-        uint256 destinationId,
-        uint256 childIndex,
-        address childAddress,
-        uint256 childId,
-        uint256 amount,
-        bytes memory data
-    ) internal {
-        Child storage child = _activeChildren[tokenId][childIndex];
+    function _transferActiveChild(TransferChildParams memory params) internal {
+        // Remove child from active children array
+        _removeChildByIndex(_activeChildren[params.tokenId], params.childIndex);
 
-        if (to == address(0)) {
-            _removeChildByIndex(_activeChildren[tokenId], childIndex);
-            delete _childIsInActive[childAddress][childId];
-            INestableERC1155(childAddress).burn(childId, amount, 0);
-        } else if (destinationId == 0) {
-            _removeChildByIndex(_activeChildren[tokenId], childIndex);
-            delete _childIsInActive[childAddress][childId];
-            IERC1155(childAddress).safeTransferFrom(
+        if (params.to == address(0)) {
+            // Burn child
+            INestableERC1155(params.childAddress).burn(
+                params.childId,
+                params.amount,
+                0
+            );
+        } else if (params.destinationId == 0) {
+            // Transfer to EOA - first update child's ownership record
+            _RMRKOwners[params.childAddress][params.childId] = DirectOwner({
+                tokenId: 0, // Not nested anymore
+                ownerAddress: params.to // New EOA owner
+            });
+
+            // Transfer child token to EOA
+            IERC1155(params.childAddress).safeTransferFrom(
                 address(this),
-                to,
-                childId,
-                amount,
-                data
+                params.to,
+                params.childId,
+                params.amount,
+                params.data
             );
         } else {
-            _removeChildByIndex(_activeChildren[tokenId], childIndex);
-            delete _childIsInActive[childAddress][childId];
-            INestableERC1155(childAddress).nestTransferFrom(
+            // Transfer to another NFT
+            INestableERC1155(params.childAddress).nestTransferFrom(
                 address(this),
-                to,
-                childId,
-                amount,
-                destinationId,
-                data
+                params.to,
+                params.childId,
+                params.amount,
+                params.destinationId,
+                params.data
             );
         }
 
         emit ChildTransferred(
-            tokenId,
-            childIndex,
-            childAddress,
-            childId,
-            amount,
+            params.tokenId,
+            params.childIndex,
+            params.childAddress,
+            params.childId,
+            params.amount,
             false,
-            to == address(0)
+            params.to == address(0)
         );
     }
-
     function burn(
         uint256 tokenId,
         uint256 amount,
         uint256 maxRecursiveBurns
     ) public override nonReentrant returns (uint256) {
         (address immediateOwner, uint256 parentId, ) = directOwnerOf(tokenId);
-        _burn(_msgSender(), tokenId, amount);
+
+        super._burn(_msgSender(), tokenId, amount);
+        if (balanceOf(_msgSender(), tokenId) == 0) {
+            delete _RMRKOwners[address(this)][tokenId];
+        }
 
         uint256 burnedChildren = _recursiveBurn(tokenId, maxRecursiveBurns);
 
-        delete _RMRKOwners[tokenId];
+        delete _RMRKOwners[address(this)][tokenId];
 
         emit NestTransfer(
             immediateOwner,
@@ -486,7 +539,6 @@ contract FNFTNestableERC1155 is Initializable, TipERC1155, INestableERC1155 {
                     ) +
                     1;
             }
-            delete _childIsInActive[child.contractAddress][child.tokenId];
         }
 
         delete _activeChildren[tokenId];
@@ -524,7 +576,6 @@ contract FNFTNestableERC1155 is Initializable, TipERC1155, INestableERC1155 {
         _removeChildByIndex(_pendingChildren[parentId], childIndex);
 
         _activeChildren[parentId].push(child);
-        _childIsInActive[childAddress][childId] = 1;
 
         emit ChildAccepted(
             parentId,
@@ -539,8 +590,16 @@ contract FNFTNestableERC1155 is Initializable, TipERC1155, INestableERC1155 {
         Child[] storage array,
         uint256 index
     ) internal {
-        require(index < array.length, "Index out of bounds");
-        array[index] = array[array.length - 1];
+        if (index >= array.length) revert FNFTNestableIndexOutOfBounds();
+
+        uint256 lastIndex = array.length - 1;
+
+        if (index != lastIndex) {
+            // Move last element to the index being removed
+            array[index] = array[lastIndex];
+        }
+
+        // Remove last element
         array.pop();
     }
 
@@ -549,42 +608,48 @@ contract FNFTNestableERC1155 is Initializable, TipERC1155, INestableERC1155 {
         uint256 tokenId
     ) internal view returns (bool) {
         address owner = ownerOf(tokenId);
-        return (spender == owner || isApprovedForAll(owner, spender));
+        bool isApproved = isApprovedForAll(owner, spender);
+        bool result = (spender == owner || isApproved);
+        return result;
     }
 
     function _exists(uint256 tokenId) internal view returns (bool) {
-        return _RMRKOwners[tokenId].ownerAddress != address(0);
+        return _RMRKOwners[address(this)][tokenId].ownerAddress != address(0);
     }
-
-    error RMRKInsufficientParentBalance();
-    error RMRKInsufficientChildBalance();
 
     function supportsInterface(
         bytes4 interfaceId
-    ) public view virtual override(TipERC1155, IERC165) returns (bool) {
+    )
+        public
+        view
+        virtual
+        override(TipERC1155, ERC1155ReceiverUpgradeable, IERC165)
+        returns (bool)
+    {
         return
             interfaceId == type(INestableERC1155).interfaceId ||
             super.supportsInterface(interfaceId);
     }
 
-    function _mint(
-        address to,
-        uint256 id,
-        uint256 amount,
-        bytes memory data
-    ) internal virtual override {
-        super._mint(to, id, amount, data);
-        _RMRKOwners[id] = DirectOwner({ownerAddress: to, tokenId: 0});
-    }
-
-    function _burn(
+    function onERC1155Received(
+        address operator,
         address from,
         uint256 id,
-        uint256 amount
-    ) internal virtual override {
-        super._burn(from, id, amount);
-        if (balanceOf(from, id) == 0) {
-            delete _RMRKOwners[id];
-        }
+        uint256 value,
+        bytes calldata data
+    ) public virtual override returns (bytes4) {
+        // You can customize logic if needed.
+        return this.onERC1155Received.selector;
+    }
+
+    function onERC1155BatchReceived(
+        address operator,
+        address from,
+        uint256[] calldata ids,
+        uint256[] calldata values,
+        bytes calldata data
+    ) public virtual override returns (bytes4) {
+        // You can customize logic if needed.
+        return this.onERC1155BatchReceived.selector;
     }
 }

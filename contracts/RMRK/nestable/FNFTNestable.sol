@@ -8,6 +8,7 @@ import "@openzeppelin/contracts-upgradeable/utils/CountersUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "../library/RMRKErrors.sol";
+import "./FNFTNestableErrors.sol";
 
 /**
  * @title FNFTNestable
@@ -31,28 +32,12 @@ contract FNFTNestable is Initializable, TipERC721, IERC7401, RMRKCore {
     // Mapping from token ID to list of pending children
     mapping(uint256 => Child[]) private _pendingChildren;
 
-    /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor() {
-        _disableInitializers();
-    }
-
     function initialize(
         string memory name_,
         string memory symbol_
     ) public override initializer {
         // Call TipERC721's initialize function
-        TipERC721.initialize(name_, symbol_);
-
-        // Initialize FNFTNestable-specific components
-        __FNFTNestable_init();
-    }
-
-    function __FNFTNestable_init() internal initializer {
-        __FNFTNestable_init_unchained();
-    }
-
-    function __FNFTNestable_init_unchained() internal initializer {
-        // Initialize any FNFTNestable specific state variables here
+        __TipERC721_init(name_, symbol_);
     }
 
     function mint(
@@ -101,6 +86,88 @@ contract FNFTNestable is Initializable, TipERC721, IERC7401, RMRKCore {
         }
     }
 
+    function _transferPendingChild(
+        uint256 tokenId,
+        address to,
+        uint256 destinationId,
+        uint256 childIndex,
+        address childAddress,
+        uint256 childId,
+        bytes memory data
+    ) internal {
+        if (to == address(0)) {
+            _removeChildByIndex(_pendingChildren[tokenId], childIndex);
+            IERC7401(childAddress).burn(childId, 0);
+        } else if (destinationId == 0) {
+            _removeChildByIndex(_pendingChildren[tokenId], childIndex);
+            IERC721(childAddress).safeTransferFrom(
+                address(this),
+                to,
+                childId,
+                data
+            );
+        } else {
+            _removeChildByIndex(_pendingChildren[tokenId], childIndex);
+            IERC7401(childAddress).nestTransferFrom(
+                address(this),
+                to,
+                childId,
+                destinationId,
+                data
+            );
+        }
+
+        emit ChildTransferred(
+            tokenId,
+            childIndex,
+            childAddress,
+            childId,
+            true,
+            to == address(0)
+        );
+    }
+
+    function _transferActiveChild(
+        uint256 tokenId,
+        address to,
+        uint256 destinationId,
+        uint256 childIndex,
+        address childAddress,
+        uint256 childId,
+        bytes memory data
+    ) internal {
+        if (to == address(0)) {
+            _removeChildByIndex(_activeChildren[tokenId], childIndex);
+            IERC7401(childAddress).burn(childId, 0);
+        } else if (destinationId == 0) {
+            _removeChildByIndex(_activeChildren[tokenId], childIndex);
+            IERC721(childAddress).safeTransferFrom(
+                address(this),
+                to,
+                childId,
+                data
+            );
+        } else {
+            _removeChildByIndex(_activeChildren[tokenId], childIndex);
+            IERC7401(childAddress).nestTransferFrom(
+                address(this),
+                to,
+                childId,
+                destinationId,
+                data
+            );
+        }
+
+        emit ChildTransferred(
+            tokenId,
+            childIndex,
+            childAddress,
+            childId,
+            false,
+            to == address(0)
+        );
+    }
+
     function burn(
         uint256 tokenId,
         uint256 maxRecursiveBurns
@@ -146,7 +213,7 @@ contract FNFTNestable is Initializable, TipERC721, IERC7401, RMRKCore {
 
         Child memory child = Child({
             tokenId: childId,
-            contractAddress: msg.sender
+            contractAddress: _msgSender()
         });
 
         _pendingChildren[parentId].push(child);
@@ -154,49 +221,64 @@ contract FNFTNestable is Initializable, TipERC721, IERC7401, RMRKCore {
         emit ChildProposed(
             parentId,
             _pendingChildren[parentId].length - 1,
-            msg.sender,
+            _msgSender(),
             childId
         );
     }
 
+    // Implementation uses direct nesting model rather than proposal/acceptance model
     function addChildNFT(
-        uint256 parentId,
-        address childAddress,
-        uint256 childId,
+        uint256 tokenId,
+        address childContract,
+        uint256 childTokenId,
         bytes memory data
-    ) public virtual {
-        require(_exists(parentId), "FNFTNestable: parent token does not exist");
+    ) external virtual {
+        require(_exists(tokenId), "FNFTNestable: invalid token ID");
         require(
-            ownerOf(parentId) == _msgSender(),
-            "FNFTNestable: caller is not the owner of the parent token"
+            _msgSender() == ownerOf(tokenId),
+            "FNFTNestable: caller is not token owner"
         );
 
-        if (IERC721(childAddress).ownerOf(childId) != _msgSender()) {
-            revert("FNFTNestable: caller is not the owner of the child token");
-        }
+        // Verify caller owns child token
+        require(
+            IERC721(childContract).ownerOf(childTokenId) == _msgSender(),
+            "FNFTNestable: caller is not child token owner"
+        );
 
         // Transfer ownership of child token to this contract
-        IERC721(childAddress).transferFrom(
+        IERC721(childContract).transferFrom(
             _msgSender(),
             address(this),
-            childId
+            childTokenId
         );
 
-        Child memory child = Child({
-            tokenId: childId,
-            contractAddress: childAddress
-        });
-
-        uint256 length = _pendingChildren[parentId].length;
-
-        if (length >= 128) {
-            revert("FNFTNestable: maximum number of pending children reached");
+        // Check if child is a nestable NFT and update direct owner
+        if (
+            IERC165Upgradeable(childContract).supportsInterface(
+                type(IERC7401).interfaceId
+            )
+        ) {
+            DirectOwner memory directOwner = DirectOwner({
+                tokenId: tokenId,
+                ownerAddress: address(this)
+            });
+            _directOwners[childTokenId] = directOwner;
         }
 
-        _pendingChildren[parentId].push(child);
+        // Add child to active children array
+        Child memory newChild = Child({
+            contractAddress: childContract,
+            tokenId: childTokenId
+        });
+        _activeChildren[tokenId].push(newChild);
 
-        // Previous length matches the index for the new child
-        emit ChildProposed(parentId, length, childAddress, childId);
+        emit NestTransfer(
+            _msgSender(), // from: previous owner
+            address(this), // to: this contract
+            0, // fromTokenId: 0 as not nested before
+            tokenId, // toTokenId: new parent token
+            childTokenId // tokenId: child token being transferred
+        );
     }
 
     function acceptChild(
@@ -290,36 +372,27 @@ contract FNFTNestable is Initializable, TipERC721, IERC7401, RMRKCore {
         childrenArray[childIndex] = childrenArray[childrenArray.length - 1];
         childrenArray.pop();
 
-        if (to == address(0)) {
-            // Transfer to zero address (burn)
-            FNFTNestable(childAddress).burn(childId, 0);
-        } else if (destinationId == 0) {
-            // Transfer to an EOA
-            FNFTNestable(childAddress).safeTransferFrom(
-                address(this),
+        if (isPending) {
+            _transferPendingChild(
+                tokenId,
                 to,
+                destinationId,
+                childIndex,
+                childAddress,
                 childId,
                 data
             );
         } else {
-            // Transfer to another token
-            FNFTNestable(childAddress).nestTransferFrom(
-                address(this),
+            _transferActiveChild(
+                tokenId,
                 to,
-                childId,
                 destinationId,
+                childIndex,
+                childAddress,
+                childId,
                 data
             );
         }
-
-        emit ChildTransferred(
-            tokenId,
-            childIndex,
-            childAddress,
-            childId,
-            isPending,
-            to == address(0)
-        );
     }
 
     function nestTransferFrom(
@@ -388,6 +461,15 @@ contract FNFTNestable is Initializable, TipERC721, IERC7401, RMRKCore {
     }
 
     // Override necessary functions from TipERC721 if needed
+
+    function _removeChildByIndex(
+        Child[] storage array,
+        uint256 index
+    ) internal {
+        if (index >= array.length) revert FNFTNestableChildIndexOutOfRange();
+        array[index] = array[array.length - 1];
+        array.pop();
+    }
 
     function supportsInterface(
         bytes4 interfaceId
